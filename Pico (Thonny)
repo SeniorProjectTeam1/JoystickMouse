@@ -1,0 +1,76 @@
+from machine import Pin, ADC, UART
+import utime
+
+# -----------------------------
+# UART0 (Pico -> Raspberry Pi)
+# TX = GP0 -> Pi RX (GPIO15 / pin 10)
+# RX = GP1 -> Pi TX (GPIO14 / pin 8)  [not required for one-way sending, but OK]
+# IMPORTANT: Pico GND must connect to Pi GND
+# -----------------------------
+uart = UART(0, 115200)  # UART0 at 115200 baud
+
+# -----------------------------
+# Joystick wiring (Pico 2)
+# VRX -> GP26 (ADC0)
+# VRY -> GP27 (ADC1)
+# SW  -> GP22 (digital input, pulled up)
+# -----------------------------
+xAxis = ADC(Pin(26))
+yAxis = ADC(Pin(27))
+button = Pin(22, Pin.IN, Pin.PULL_UP)
+
+# -----------------------------
+# Calibrate center position
+# -----------------------------
+samples = 50
+x0 = 0
+y0 = 0
+
+for _ in range(samples):
+    x0 += xAxis.read_u16()
+    y0 += yAxis.read_u16()
+    utime.sleep(0.02)
+
+x0 //= samples
+y0 //= samples
+
+deadzone = 6000  # adjust 4000-10000 if too sensitive
+
+def get_direction(x, y):
+    dx = x - x0
+    dy = y - y0
+
+    # deadzone
+    if abs(dx) < deadzone and abs(dy) < deadzone:
+        return "CENTER"
+
+    # pick dominant axis
+    if abs(dx) > abs(dy):
+        return "RIGHT" if dx > 0 else "LEFT"
+    else:
+        # many joysticks invert Y; this mapping is common
+        return "UP" if dy < 0 else "DOWN"
+
+# Send a startup marker so you can confirm it's running
+uart.write("PICO_UART_OK\n")
+
+# -----------------------------
+# Main loop
+# -----------------------------
+while True:
+    xValue = xAxis.read_u16()
+    yValue = yAxis.read_u16()
+    buttonPressed = (button.value() == 0)
+
+    direction = get_direction(xValue, yValue)
+
+    # CSV: x,y,direction,button\n
+    msg = "{},{},{},{}\n".format(
+        xValue,
+        yValue,
+        direction,
+        1 if buttonPressed else 0
+    )
+
+    uart.write(msg)
+    utime.sleep(0.05)

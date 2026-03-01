@@ -1,0 +1,128 @@
+#import serial
+import time
+import math
+import uinput
+
+PORT = "/dev/serial0"
+BAUD = 115200
+
+# Virtual mouse
+mouse = uinput.Device([
+    uinput.REL_X,
+    uinput.REL_Y,
+    uinput.BTN_LEFT,
+])
+
+# ---- Tuning knobs ----
+DEADZONE = 7000        # ignore small jitter near center (try 5000-12000)
+MAX_STEP = 18          # max pixels per update (try 10-30)
+EXPONENT = 1.4         # >1 makes it less sensitive near center, faster near edge (1.2-2.0)
+UPDATE_HZ = 80         # higher = smoother (50-120)
+CLICK_DEBOUNCE = 0.20  # seconds
+
+# Optional invert (depends on your joystick orientation)
+INVERT_Y = False
+INVERT_X = False
+SWAP_XY = True
+# We'll learn center from the incoming stream (robust)
+CAL_SAMPLES = 40
+cx = 0
+cy = 0
+
+prev_btn = "0"
+last_click = 0.0
+
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+def apply_response_curve(mag_norm):
+    # mag_norm is 0..1
+    return mag_norm ** EXPONENT
+
+with serial.Serial(PORT, BAUD, timeout=0.2) as ser:
+    time.sleep(0.5)
+    print("Listening on", PORT)
+
+    # --- Calibrate center from first samples ---
+    got = 0
+    while got < CAL_SAMPLES:
+        raw = ser.readline()
+        if not raw:
+            continue
+        line = raw.decode(errors="ignore").strip()
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 4:
+            continue
+        x_str, y_str, _, _ = parts
+        try:
+            x = int(x_str)
+            y = int(y_str)
+        except:
+            continue
+        cx += x
+        cy += y
+        got += 1
+
+    cx //= CAL_SAMPLES
+    cy //= CAL_SAMPLES
+    print("Center calibrated:", cx, cy)
+
+    dt = 1.0 / UPDATE_HZ
+
+    while True:
+        raw = ser.readline()
+        if not raw:
+            continue
+
+        line = raw.decode(errors="ignore").strip()
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 4:
+            continue
+
+        x_str, y_str, _, btn = parts
+
+        try:
+            x = int(x_str)
+            y = int(y_str)
+        except:
+            continue
+
+        dx = x - cx
+        dy = y - cy
+        if INVERT_Y:
+            dy = -dy
+
+        # magnitude
+        mag = math.sqrt(dx*dx + dy*dy)
+
+        if mag > DEADZONE:
+            # Normalize to 0..1 (Pico ADC is 0..65535; half-range ~32768)
+            # Use 30000-ish as a practical max deflection from center
+            mag_norm = clamp((mag - DEADZONE) / 30000.0, 0.0, 1.0)
+            mag_curve = apply_response_curve(mag_norm)
+
+            step = int(1 + mag_curve * MAX_STEP)
+
+            # unit vector
+            ux = dx / mag
+            uy = dy / mag
+
+            move_x = int(ux * step)
+            move_y = int(uy * step)
+
+            # emit relative move
+            if move_x != 0:
+                mouse.emit(uinput.REL_X, move_x, syn=False)
+            if move_y != 0:
+                mouse.emit(uinput.REL_Y, move_y, syn=False)
+            mouse.syn()
+
+        # Click on rising edge
+        now = time.time()
+        if prev_btn == "0" and btn == "1" and (now - last_click) > CLICK_DEBOUNCE:
+            mouse.emit(uinput.BTN_LEFT, 1)
+            mouse.emit(uinput.BTN_LEFT, 0, syn=True)
+            last_click = now
+        prev_btn = btn
+
+        time.sleep(dt)

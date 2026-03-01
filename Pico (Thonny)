@@ -1,76 +1,68 @@
 from machine import Pin, ADC, UART
 import utime
 
-# -----------------------------
-# UART0 (Pico -> Raspberry Pi)
-# TX = GP0 -> Pi RX (GPIO15 / pin 10)
-# RX = GP1 -> Pi TX (GPIO14 / pin 8)  [not required for one-way sending, but OK]
-# IMPORTANT: Pico GND must connect to Pi GND
-# -----------------------------
-uart = UART(0, 115200)  # UART0 at 115200 baud
+# ---------- UART ----------
+uart = UART(0, baudrate=115200, tx=Pin(0), rx=Pin(1))
 
-# -----------------------------
-# Joystick wiring (Pico 2)
-# VRX -> GP26 (ADC0)
-# VRY -> GP27 (ADC1)
-# SW  -> GP22 (digital input, pulled up)
-# -----------------------------
-xAxis = ADC(Pin(26))
-yAxis = ADC(Pin(27))
-button = Pin(22, Pin.IN, Pin.PULL_UP)
+# ---------- Joystick ----------
+xAxis = ADC(Pin(26))   # ADC0
+yAxis = ADC(Pin(27))   # ADC1
+joy_btn = Pin(22, Pin.IN, Pin.PULL_UP)
 
-# -----------------------------
-# Calibrate center position
-# -----------------------------
+# Calibrate center
 samples = 50
 x0 = 0
 y0 = 0
-
 for _ in range(samples):
     x0 += xAxis.read_u16()
     y0 += yAxis.read_u16()
-    utime.sleep(0.02)
-
+    utime.sleep(0.01)
 x0 //= samples
 y0 //= samples
 
-deadzone = 6000  # adjust 4000-10000 if too sensitive
+# ---------- Rotary Encoder (Volume) ----------
+# CLK -> GP16, DT -> GP17, SW -> GP18
+enc_clk = Pin(16, Pin.IN, Pin.PULL_UP)
+enc_dt  = Pin(17, Pin.IN, Pin.PULL_UP)
+enc_sw  = Pin(18, Pin.IN, Pin.PULL_UP)
 
-def get_direction(x, y):
-    dx = x - x0
-    dy = y - y0
+last_clk = enc_clk.value()
+last_sw = enc_sw.value()
 
-    # deadzone
-    if abs(dx) < deadzone and abs(dy) < deadzone:
-        return "CENTER"
+def read_encoder_delta():
+    global last_clk
+    clk = enc_clk.value()
+    delta = 0
+    if clk != last_clk:
+        # Determine direction by reading DT when CLK changes
+        if enc_dt.value() != clk:
+            delta = +1
+        else:
+            delta = -1
+        last_clk = clk
+    return delta
 
-    # pick dominant axis
-    if abs(dx) > abs(dy):
-        return "RIGHT" if dx > 0 else "LEFT"
-    else:
-        # many joysticks invert Y; this mapping is common
-        return "UP" if dy < 0 else "DOWN"
+def read_mute_press():
+    global last_sw
+    sw = enc_sw.value()
+    mute = 0
+    # edge detect press (pull-up => pressed=0)
+    if last_sw == 1 and sw == 0:
+        mute = 1
+    last_sw = sw
+    return mute
 
-# Send a startup marker so you can confirm it's running
-uart.write("PICO_UART_OK\n")
-
-# -----------------------------
-# Main loop
-# -----------------------------
 while True:
-    xValue = xAxis.read_u16()
-    yValue = yAxis.read_u16()
-    buttonPressed = (button.value() == 0)
+    # --- joystick packet ---
+    x = xAxis.read_u16()
+    y = yAxis.read_u16()
+    btn = 1 if joy_btn.value() == 0 else 0
+    uart.write("JOY,%d,%d,%d\n" % (x, y, btn))
 
-    direction = get_direction(xValue, yValue)
+    # --- volume packet (only send when something happens) ---
+    d = read_encoder_delta()
+    m = read_mute_press()
+    if d != 0 or m != 0:
+        uart.write("VOL,%d,%d\n" % (d, m))
 
-    # CSV: x,y,direction,button\n
-    msg = "{},{},{},{}\n".format(
-        xValue,
-        yValue,
-        direction,
-        1 if buttonPressed else 0
-    )
-
-    uart.write(msg)
-    utime.sleep(0.05)
+    utime.sleep(0.01)  # 100 Hz
